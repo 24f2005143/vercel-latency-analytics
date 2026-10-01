@@ -1,147 +1,120 @@
+import os
+import traceback
+from io import StringIO
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pathlib import Path
-import json
-import math
+from openai import OpenAI
+
 
 app = FastAPI()
 
-
-# --------------------------------------------------
-# CORS
-# --------------------------------------------------
-# Allow POST requests from any origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["POST"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# --------------------------------------------------
-# Load telemetry dataset
-# --------------------------------------------------
-DATA_FILE = (
-    Path(__file__).resolve().parent.parent
-    / "q-vercel-latency.json"
-)
-
-with open(DATA_FILE, "r", encoding="utf-8") as file:
-    telemetry = json.load(file)
+class CodeRequest(BaseModel):
+    code: str
 
 
-# --------------------------------------------------
-# Request model
-# --------------------------------------------------
-class AnalyticsRequest(BaseModel):
-    regions: list[str]
-    threshold_ms: float
+class ErrorAnalysis(BaseModel):
+    error_lines: list[int]
 
 
-# --------------------------------------------------
-# P95 calculation
-# --------------------------------------------------
-def percentile(values: list[float], p: float) -> float:
-    """
-    Calculate percentile using linear interpolation.
-    """
+def execute_python_code(code: str) -> dict:
+    old_stdout = sys.stdout
+    sys.stdout = StringIO()
 
-    if not values:
-        raise ValueError("Cannot calculate percentile of empty data.")
+    try:
+        exec(code, {})
+        output = sys.stdout.getvalue()
+        return {
+            "success": True,
+            "output": output,
+        }
 
-    sorted_values = sorted(values)
+    except Exception:
+        output = traceback.format_exc()
+        return {
+            "success": False,
+            "output": output,
+        }
 
-    if len(sorted_values) == 1:
-        return sorted_values[0]
+    finally:
+        sys.stdout = old_stdout
 
-    position = (len(sorted_values) - 1) * (p / 100)
 
-    lower_index = math.floor(position)
-    upper_index = math.ceil(position)
+def analyze_error_with_ai(code: str, error_traceback: str) -> list[int]:
+    token = os.environ.get("AIPIPE_TOKEN")
 
-    if lower_index == upper_index:
-        return sorted_values[lower_index]
+    if not token:
+        raise RuntimeError("AIPIPE_TOKEN is not configured")
 
-    weight = position - lower_index
-
-    return (
-        sorted_values[lower_index]
-        + weight
-        * (
-            sorted_values[upper_index]
-            - sorted_values[lower_index]
-        )
+    client = OpenAI(
+        api_key=token,
+        base_url="https://aipipe.org/openai/v1",
     )
 
+    prompt = f"""
+Analyze the Python code and its traceback.
 
-# --------------------------------------------------
-# POST analytics endpoint
-# --------------------------------------------------
-@app.post("/")
-def analytics(request: AnalyticsRequest):
+Your task is to identify the exact source-code line number(s)
+where the error occurred.
 
-    results = []
+Return ONLY valid JSON in this exact format:
+{{"error_lines":[3]}}
 
-    for region in request.regions:
+CODE:
+{code}
 
-        # Select records belonging to this region
-        rows = [
-            record
-            for record in telemetry
-            if record["region"] == region
-        ]
+TRACEBACK:
+{error_traceback}
+"""
 
-        # Handle unknown region
-        if not rows:
-            results.append(
-                {
-                    "region": region,
-                    "avg_latency": None,
-                    "p95_latency": None,
-                    "avg_uptime": None,
-                    "breaches": 0,
-                }
-            )
-            continue
-
-        # Extract latency and uptime values
-        latencies = [
-            record["latency_ms"]
-            for record in rows
-        ]
-
-        uptimes = [
-            record["uptime_pct"]
-            for record in rows
-        ]
-
-        # Average latency
-        avg_latency = sum(latencies) / len(latencies)
-
-        # 95th percentile latency
-        p95_latency = percentile(latencies, 95)
-
-        # Average uptime
-        avg_uptime = sum(uptimes) / len(uptimes)
-
-        # Count latency values ABOVE threshold
-        breaches = sum(
-            1
-            for latency in latencies
-            if latency > request.threshold_ms
-        )
-
-        results.append(
+    response = client.chat.completions.create(
+        model="gpt-5-nano",
+        messages=[
             {
-                "region": region,
-                "avg_latency": avg_latency,
-                "p95_latency": p95_latency,
-                "avg_uptime": avg_uptime,
-                "breaches": breaches,
+                "role": "system",
+                "content": "Return only the requested JSON object."
+            },
+            {
+                "role": "user",
+                "content": prompt
             }
-        )
+        ],
+        response_format={"type": "json_object"},
+    )
 
-    return results
+    content = response.choices[0].message.content
+    result = ErrorAnalysis.model_validate_json(content)
+
+    return result.error_lines
+
+
+@app.post("/code-interpreter")
+def code_interpreter(request: CodeRequest):
+    execution = execute_python_code(request.code)
+
+    if execution["success"]:
+        return {
+            "error": [],
+            "result": execution["output"],
+        }
+
+    error_lines = analyze_error_with_ai(
+        request.code,
+        execution["output"],
+    )
+
+    return {
+        "error": error_lines,
+        "result": execution["output"],
+    }
